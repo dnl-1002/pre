@@ -267,11 +267,6 @@ def find_mysql_match_12h_data(current_time_before_12h_arr,datebase_conn,table_na
     }
     '''
 
-    define_concomitant_variable_list = {
-        'Temperature':[19.64, 19.7525, 19.835, 19.8825, 19.9275, 19.915, 20.0525, 20.315, 20.405, 20.445, 20.13, 19.995],  # 温度
-        'Salinity':[33.095, 33.1275, 33.1725, 33.1675, 33.125, 33.0625, 33.0625, 33.13, 33.13, 33.03, 32.965, 33.01]  # 盐度
-     }
-
     # 构造 SQL 查询语句
     find_sql = f"""SELECT * FROM {table_name} WHERE SnapTime >= '{current_time_before_12h_arr[-1]}' 
     AND SnapTime <= '{current_time_before_12h_arr[0]}' AND SummaryInterval=60"""
@@ -322,7 +317,7 @@ def find_mysql_match_12h_data(current_time_before_12h_arr,datebase_conn,table_na
                         temp_concomitant_variable_arr.append(float(df.loc[row_index, concomitant_variable_i]))
                     except:
                         ###如果协变量查询报错，说明不存在协变量关键字
-                        temp_concomitant_variable_arr.append(define_concomitant_variable_list[concomitant_variable_i][num])
+                        temp_concomitant_variable_arr.append(0.0)
                 else:
                     ###如果协变量部分时间不存在，则取插值
                     temp_concomitant_variable_arr.append(0.0)

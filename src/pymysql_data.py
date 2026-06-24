@@ -22,7 +22,9 @@ def mysqlinsert_12h_predict(conn,tab_name,signal_info_arr,key_name_arr):
         insert_query = f"""INSERT INTO {tab_name} ({columns}) SELECT {values_num} FROM DUAL WHERE NOT EXISTS(SELECT 1 FROM {tab_name} WHERE Snaptime = %s)"""
         cur.execute(insert_query, signal_info_tuple + (signal_info_tuple[0],))
     except Exception as e:
+        conn.rollback()
         print('Insert error:', e)
+        raise
 
     # 真正的执行语句
     cur.close()
