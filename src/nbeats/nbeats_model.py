@@ -16,16 +16,16 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
     预测接口函数
 
     参数:
-    historical_data: 字典，包含过去12个点的数据，格式如下：
+    historical_data: 字典，包含过去7个日级数据点，格式如下：
         {
-            'y': [v1, v2, ..., v12],        # 目标变量(桡足类)最近12个点的值
-            'Temp_C': [t1, t2, ..., t12],   # 温度最近12个点的值
-            'Sal': [s1, s2, ..., s12]       # 盐度最近12个点的值
+            'y': [v1, v2, ..., v7],                 # 目标变量最近7天的值
+            'Temperature': [t1, t2, ..., t7],        # 温度最近7天的值
+            'Salinity': [s1, s2, ..., s7]            # 盐度最近7天的值
         }
     model_dir: 保存模型的目录路径
 
     返回:
-    predictions: numpy数组，包含未来2个时间点的预测值
+    predictions: numpy数组，包含未来1个日级时间点的预测值
     """
     Salinity_str = 'Salinity'
     Temperature_str ='Temperature'
@@ -37,7 +37,7 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
                 raise ValueError(f"{key} 需要 {required_length} 个历史数据点，但提供了 {len(values)} 个")
 
         # 2. 加载模型
-        model_path = os.path.join(model_dir, 'nbeats_model.pkl')
+        model_path = os.path.join(model_dir, bio_i_str+'_d7_nbeats_model.pkl')
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
         sal_mean = np.mean(historical_data[Salinity_str])
@@ -67,15 +67,15 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
         ts_dataset = TimeSeriesDataset(
             Y_df=Y_df,
             X_df=X_df,
-            ts_train_mask=[0] * required_length  # 测试模式
+            ts_train_mask=[0] * required_length  # 预测模式
         )
 
         test_loader = TimeSeriesLoader(
             model='nbeats',
             ts_dataset=ts_dataset,
-            window_sampling_limit=12,  # 使用与训练时相同的值
+            window_sampling_limit=7,  # 使用与训练时相同的值
             offset=0,
-            input_size=12,
+            input_size=7,
             output_size=1,
             idx_to_sample_freq=1,
             batch_size=8,
@@ -155,7 +155,7 @@ def h12_predict_next_1h_points(historical_data,bio_i_str, model_dir='saved_model
         ts_dataset = TimeSeriesDataset(
             Y_df=Y_df,
             X_df=X_df,
-            ts_train_mask=[0] * required_length  # 测试模式
+            ts_train_mask=[0] * required_length  # 预测模式
         )
 
         test_loader = TimeSeriesLoader(

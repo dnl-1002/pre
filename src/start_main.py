@@ -1,14 +1,14 @@
 
 """
-12h -> 1h plankton abundance prediction entrypoint.
+浮游生物丰度预测入口。
 
-This script is intended to be called once per hour by an external scheduler.
-It reads the latest 12 hourly records, predicts the next hour for each target
-species, writes one complete prediction row, then optionally retrains the
-daily models after the prediction succeeds.
+该脚本由外部调度器定时调用，每次只执行一轮预测，不在脚本内部常驻循环。
+当前稳定实现包含两条链路：
+1. 小时预测：使用过去 12 小时数据预测未来 1 小时。
+2. 日预测：在指定小时使用过去 7 个完整自然日数据预测当前自然日。
 
-The legacy exploratory code is kept below for reference, but normal
-`python start_main.py` execution exits through this entrypoint before reaching it.
+文件下方保留了之前探索阶段代码作为参考，但正常执行 `python start_main.py`
+会在本入口结束，不会继续执行旧代码。
 """
 
 import os as _os
@@ -16,12 +16,15 @@ import sys as _sys
 import traceback as _traceback
 from datetime import datetime as _datetime, timedelta as _timedelta
 
+import pandas as _pd
+
 from all_function import (
     find_mysql_match_12h_data as _find_mysql_match_12h_data,
     get_currenttime_before_12hour_fun as _get_currenttime_before_12hour_fun,
-    write_h_data_to_train_tab as _write_h_data_to_train_tab,
 )
 from h12_model_train import read_12h_train_tab_to_train_model_fun as _read_12h_train_tab_to_train_model_fun
+from h12_model_train import read_7d_train_tab_to_train_model_fun as _read_7d_train_tab_to_train_model_fun
+from nbeats.nbeats_model import d7_predict_next_1d_points as _d7_predict_next_1d_points
 from nbeats.nbeats_model import h12_predict_next_1h_points as _h12_predict_next_1h_points
 from pymysql_data import create_mysql as _create_mysql
 from pymysql_data import mysqlConnect as _mysqlConnect
@@ -32,7 +35,7 @@ _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _os.chdir(_SCRIPT_DIR)
 
 
-#### Database configuration.
+#### 数据库配置。
 DATA_IP = "192.168.2.82"
 DATA_PORT = 3306
 DATA_USER = "root"
@@ -40,24 +43,32 @@ DATA_PASSWORD = "root"
 DATA_NAME = "szsw"
 
 
-#### Table configuration used by the first stable version.
+#### 表配置。
 SOURCE_AVG_TABLE = "tab_biology_avg"
 TRAIN_12H_TABLE = "tab_train_12h"
 PREDICT_12H_RECORD_TABLE = "tab_predict_12h_record"
+PREDICT_12H_INPUT_TABLE = "tab_predict_12h_input_record"
+TRAIN_7D_TABLE = "tab_train_7d"
+PREDICT_7D_RECORD_TABLE = "tab_predict_7d_record"
+PREDICT_7D_INPUT_TABLE = "tab_predict_7d_input_record"
 
 
-#### Species and exogenous variables.
+#### 预测物种和协变量。
 NEED_PREDICT_BIO = ["Medusae", "Copepoda"]
 CONCOMITANT_VARIABLES = ["Temperature", "Salinity"]
 
 
-#### Model and runtime configuration.
+#### 模型和运行配置。
 MODEL_DIR = "saved_models"
 ENABLE_TEST_TIME_OVERRIDE = False
 TEST_CURRENT_TIME = "2024-06-15 23:00:00"
+ENABLE_7D_PREDICTION = True
+DAILY_PREDICTION_HOUR = 0
+MIN_HOURLY_SOURCE_POINTS = 24
+MIN_DAILY_SOURCE_DAYS = 7
 
 
-#### Fields used when creating the training and prediction tables.
+#### 建表字段。
 TABLE_CREATE_COLUMNS = [
     "SnapTime",
     "Chaetognatha",
@@ -71,16 +82,20 @@ TABLE_CREATE_COLUMNS = [
     "Salinity",
 ]
 
+PREDICT_12H_INPUT_COLUMNS = ["PredictSnapTime"] + TABLE_CREATE_COLUMNS
+PREDICT_7D_INPUT_COLUMNS = ["PredictSnapTime"] + TABLE_CREATE_COLUMNS
+
 
 def _get_current_hour():
-    """Return the scheduler time rounded down to the hour."""
+    """获取当前调度时间，并向下归整到整点。"""
     if ENABLE_TEST_TIME_OVERRIDE:
+        # TEST_CURRENT_TIME = _datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return _datetime.strptime(TEST_CURRENT_TIME, "%Y-%m-%d %H:%M:%S")
     return _datetime.now().replace(minute=0, second=0, microsecond=0)
 
 
 def _ensure_required_tables():
-    """Create only the first-version tables required by the 12h pipeline."""
+    """创建当前稳定链路需要的训练表和预测记录表。"""
     _create_mysql(TABLE_CREATE_COLUMNS, DATA_IP, DATA_PORT, DATA_USER, DATA_PASSWORD, DATA_NAME, TRAIN_12H_TABLE)
     _create_mysql(
         TABLE_CREATE_COLUMNS,
@@ -91,28 +106,77 @@ def _ensure_required_tables():
         DATA_NAME,
         PREDICT_12H_RECORD_TABLE,
     )
+    _create_mysql(
+        PREDICT_12H_INPUT_COLUMNS,
+        DATA_IP,
+        DATA_PORT,
+        DATA_USER,
+        DATA_PASSWORD,
+        DATA_NAME,
+        PREDICT_12H_INPUT_TABLE,
+    )
+    _create_mysql(TABLE_CREATE_COLUMNS, DATA_IP, DATA_PORT, DATA_USER, DATA_PASSWORD, DATA_NAME, TRAIN_7D_TABLE)
+    _create_mysql(
+        TABLE_CREATE_COLUMNS,
+        DATA_IP,
+        DATA_PORT,
+        DATA_USER,
+        DATA_PASSWORD,
+        DATA_NAME,
+        PREDICT_7D_RECORD_TABLE,
+    )
+    _create_mysql(
+        PREDICT_7D_INPUT_COLUMNS,
+        DATA_IP,
+        DATA_PORT,
+        DATA_USER,
+        DATA_PASSWORD,
+        DATA_NAME,
+        PREDICT_7D_INPUT_TABLE,
+    )
 
 
 def _connect_database():
     return _mysqlConnect(DATA_IP, DATA_PORT, DATA_USER, DATA_PASSWORD, DATA_NAME)
 
 
-def _validate_model_files():
-    """Fail early if any required species model is missing."""
+def _model_path(bio_name, model_suffix=""):
+    return _os.path.join(MODEL_DIR, f"{bio_name}{model_suffix}_nbeats_model.pkl")
+
+
+def _validate_model_files(model_suffix=""):
+    """预测前校验目标物种模型文件是否存在。"""
     missing_models = []
     for bio_name in NEED_PREDICT_BIO:
-        model_path = _os.path.join(MODEL_DIR, f"{bio_name}_nbeats_model.pkl")
+        model_path = _model_path(bio_name, model_suffix)
         if not _os.path.exists(model_path):
             missing_models.append(model_path)
     if missing_models:
         raise FileNotFoundError("缺少模型文件: " + ", ".join(missing_models))
 
 
-def _should_retrain_today(current_time):
-    """Retrain when any target species model file is older than current date."""
+def _has_missing_model_files(model_suffix=""):
+    """判断是否存在缺失的目标物种模型文件。"""
+    return any(not _os.path.exists(_model_path(bio_name, model_suffix)) for bio_name in NEED_PREDICT_BIO)
+
+
+def _ensure_hourly_models_exist(conn):
+    """小时模型缺失时，先尝试训练，训练后再次校验模型文件。"""
+    if not _has_missing_model_files():
+        return
+
+    print("小时模型文件缺失，开始先训练小时模型")
+    trained = _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
+    if trained is False:
+        raise RuntimeError("小时模型文件缺失，且训练数据不足，无法完成预测")
+    _validate_model_files()
+
+
+def _should_retrain_today(current_time, model_suffix=""):
+    """任一目标物种模型文件早于当前日期时，触发每日重训。"""
     current_date = current_time.date()
     for bio_name in NEED_PREDICT_BIO:
-        model_path = _os.path.join(MODEL_DIR, f"{bio_name}_nbeats_model.pkl")
+        model_path = _model_path(bio_name, model_suffix)
         if not _os.path.exists(model_path):
             return True
         model_date = _datetime.fromtimestamp(_os.path.getmtime(model_path)).date()
@@ -122,8 +186,8 @@ def _should_retrain_today(current_time):
     return False
 
 
-def _predict_all_species(history_by_species, target_time):
-    """Predict all species first, then return one complete DB row."""
+def _predict_all_species(history_by_species, target_time, predict_func):
+    """所有物种都预测成功后，返回一条完整预测记录。"""
     predict_row = {"SnapTime": target_time}
 
     for bio_name in NEED_PREDICT_BIO:
@@ -131,7 +195,7 @@ def _predict_all_species(history_by_species, target_time):
             raise KeyError(f"查询结果中缺少物种 {bio_name}")
 
         historical_data = history_by_species[bio_name]
-        predictions = _h12_predict_next_1h_points(historical_data, bio_name, model_dir=MODEL_DIR)
+        predictions = predict_func(historical_data, bio_name, model_dir=MODEL_DIR)
         if len(predictions) == 0:
             raise ValueError(f"{bio_name} 模型未返回预测值")
 
@@ -143,51 +207,275 @@ def _predict_all_species(history_by_species, target_time):
     return predict_row
 
 
-def _run_once():
-    current_time = _get_current_hour()
+def _insert_row_if_missing(conn, table_name, row_data, unique_keys=None):
+    """按指定字段去重插入一条记录，默认按 SnapTime 去重。"""
+    if unique_keys is None:
+        unique_keys = ["SnapTime"]
+
+    columns = list(row_data.keys())
+    values = list(row_data.values())
+    placeholders = ", ".join(["%s"] * len(values))
+    column_sql = ", ".join(columns)
+    unique_sql = " AND ".join([f"{key} = %s" for key in unique_keys])
+    unique_values = tuple(row_data[key] for key in unique_keys)
+    sql = (
+        f"INSERT INTO {table_name} ({column_sql}) "
+        f"SELECT {placeholders} FROM DUAL "
+        f"WHERE NOT EXISTS(SELECT 1 FROM {table_name} WHERE {unique_sql})"
+    )
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, tuple(values) + unique_values)
+        affected_rows = cursor.rowcount
+        conn.commit()
+        return affected_rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+def _record_exists(conn, table_name, snap_time):
+    """检查某个预测时刻是否已经存在记录。"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SELECT 1 FROM {table_name} WHERE SnapTime = %s LIMIT 1", (snap_time,))
+        return cursor.fetchone() is not None
+    finally:
+        cursor.close()
+
+
+def _count_recent_hourly_points(conn, current_time):
+    """统计当前整点前 24 小时源表中真实存在的小时记录数。"""
+    start_time = current_time - _timedelta(hours=23)
+    sql = f"""SELECT COUNT(DISTINCT SnapTime) FROM {SOURCE_AVG_TABLE}
+    WHERE SnapTime >= %s AND SnapTime <= %s AND SummaryInterval=60 AND DeviceID=1"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, (start_time, current_time))
+        result = cursor.fetchone()
+        return int(result[0]) if result and result[0] is not None else 0
+    finally:
+        cursor.close()
+
+
+def _write_hourly_window_to_predict_input(conn, history_by_species, current_time, target_time):
+    """把本次预测使用的 12 小时输入窗口写入预测输入留痕表。"""
+    for index in range(12):
+        snap_time = current_time - _timedelta(hours=11 - index)
+        row_data = {'PredictSnapTime': target_time, 'SnapTime': snap_time}
+        for bio_name in NEED_PREDICT_BIO:
+            row_data[bio_name] = history_by_species[bio_name]['y'][index]
+        for variable_name in CONCOMITANT_VARIABLES:
+            row_data[variable_name] = history_by_species[NEED_PREDICT_BIO[0]][variable_name][index]
+        _insert_row_if_missing(
+            conn,
+            PREDICT_12H_INPUT_TABLE,
+            row_data,
+            unique_keys=["PredictSnapTime", "SnapTime"],
+        )
+
+
+def _write_recent_source_hours_to_train(conn):
+    """同步源表全部小时历史数据到小时训练表，缺失整点由训练阶段插值补齐。"""
+    find_sql = f"""SELECT * FROM {SOURCE_AVG_TABLE}
+    WHERE SummaryInterval=60 AND DeviceID=1"""
+    df = _pd.read_sql(find_sql, conn)
+    if 'SnapTime' not in df.columns:
+        return
+    df['SnapTime'] = _pd.to_datetime(df['SnapTime'], errors='coerce')
+    df = df.dropna(subset=['SnapTime']).sort_values('SnapTime')
+
+    inserted_count = 0
+    for _, source_row in df.iterrows():
+        snap_time = source_row['SnapTime']
+        row_data = {'SnapTime': snap_time.to_pydatetime()}
+        for column_name in TABLE_CREATE_COLUMNS:
+            if column_name == 'SnapTime':
+                continue
+            if column_name in df.columns:
+                value = _pd.to_numeric(_pd.Series([source_row[column_name]]), errors='coerce').iloc[0]
+                row_data[column_name] = 0.0 if _pd.isna(value) else float(value)
+        inserted_count += _insert_row_if_missing(conn, TRAIN_12H_TABLE, row_data)
+    print(f"小时训练表同步完成：源表小时历史数据 {len(df)} 条，本次新增 {inserted_count} 条到 {TRAIN_12H_TABLE}")
+
+
+def _build_daily_history(conn, target_day):
+    """聚合日级数据：预测输入取最近 7 天，训练表使用源表全部历史日均值。"""
+    start_day = target_day - _timedelta(days=7)
+    find_sql = f"""SELECT * FROM {SOURCE_AVG_TABLE}
+    WHERE SnapTime < %s AND SummaryInterval=60 AND DeviceID=1"""
+    # print(find_sql) # 测试查询输出
+
+    df = _pd.read_sql(find_sql, conn, params=(target_day,))
+    if 'SnapTime' in df.columns:
+        df['SnapTime'] = _pd.to_datetime(df['SnapTime'], errors='coerce')
+        df = df.dropna(subset=['SnapTime'])
+        df['Day'] = df['SnapTime'].dt.date
+
+    history_by_species = {
+        bio_name: {'y': [], 'Temperature': [], 'Salinity': []}
+        for bio_name in NEED_PREDICT_BIO
+    }
+    daily_train_rows = []
+    daily_row_by_day = {}
+    source_days = set(df['Day'].dropna().tolist()) if 'Day' in df.columns else set()
+
+    last_history_day = (target_day - _timedelta(days=1)).date()
+
+    if 'Day' in df.columns and not df.empty:
+        for day, day_df in df.groupby('Day'):
+            if day > last_history_day:
+                continue
+            day_snap_time = _datetime.combine(day, _datetime.min.time())
+            daily_row = {'SnapTime': day_snap_time}
+            for column_name in TABLE_CREATE_COLUMNS:
+                if column_name == 'SnapTime':
+                    continue
+                if column_name in day_df.columns and not day_df.empty:
+                    value = _pd.to_numeric(day_df[column_name], errors='coerce').mean()
+                    daily_row[column_name] = 0.0 if _pd.isna(value) else float(value)
+                else:
+                    daily_row[column_name] = 0.0
+            daily_train_rows.append(daily_row)
+            daily_row_by_day[day] = daily_row
+
+    for day_offset in range(7):
+        day = (start_day + _timedelta(days=day_offset)).date()
+        day_snap_time = _datetime.combine(day, _datetime.min.time())
+        daily_row = daily_row_by_day.get(day)
+        if daily_row is None:
+            daily_row = {'SnapTime': day_snap_time}
+            for column_name in TABLE_CREATE_COLUMNS:
+                if column_name != 'SnapTime':
+                    daily_row[column_name] = 0.0
+        for bio_name in NEED_PREDICT_BIO:
+            history_by_species[bio_name]['y'].append(daily_row[bio_name])
+            history_by_species[bio_name]['Temperature'].append(daily_row['Temperature'])
+            history_by_species[bio_name]['Salinity'].append(daily_row['Salinity'])
+
+    # print(f"日级历史数据: {history_by_species}") # 测试输出
+    return history_by_species, daily_train_rows, source_days
+
+
+def _write_daily_train_rows(conn, daily_rows):
+    """把日级历史数据写入 7d 训练表，已存在的日期不重复插入。"""
+    inserted_count = 0
+    for row_data in daily_rows:
+        inserted_count += _insert_row_if_missing(conn, TRAIN_7D_TABLE, row_data)
+    print(f"7d训练表同步完成：源表历史日均值 {len(daily_rows)} 天，本次新增 {inserted_count} 天到 {TRAIN_7D_TABLE}")
+
+
+def _write_daily_window_to_predict_input(conn, history_by_species, target_day):
+    """把本次日预测使用的 7 天输入窗口写入预测输入留痕表。"""
+    start_day = target_day - _timedelta(days=7)
+    for index in range(7):
+        snap_time = start_day + _timedelta(days=index)
+        row_data = {'PredictSnapTime': target_day, 'SnapTime': snap_time}
+        for bio_name in NEED_PREDICT_BIO:
+            row_data[bio_name] = history_by_species[bio_name]['y'][index]
+        for variable_name in CONCOMITANT_VARIABLES:
+            row_data[variable_name] = history_by_species[NEED_PREDICT_BIO[0]][variable_name][index]
+        _insert_row_if_missing(
+            conn,
+            PREDICT_7D_INPUT_TABLE,
+            row_data,
+            unique_keys=["PredictSnapTime", "SnapTime"],
+        )
+
+
+def _run_12h_pipeline(conn, current_time):
+    """执行 12h -> 1h 小时预测链路。"""
     target_time = current_time + _timedelta(hours=1)
+    print(f"小时预测目标时间: {target_time}")
+
+    real_hourly_points = _count_recent_hourly_points(conn, current_time)
+    if real_hourly_points < MIN_HOURLY_SOURCE_POINTS:
+        print(f"小时预测跳过：当前时间前24小时真实数据只有 {real_hourly_points} 条，少于 {MIN_HOURLY_SOURCE_POINTS} 条")
+        return
+
+    before_12h_times = _get_currenttime_before_12hour_fun(current_time)
+    history_by_species = _find_mysql_match_12h_data(
+        before_12h_times,
+        conn,
+        SOURCE_AVG_TABLE,
+        NEED_PREDICT_BIO,
+        CONCOMITANT_VARIABLES,
+    )
+
+    _write_recent_source_hours_to_train(conn)
+    _ensure_hourly_models_exist(conn)
+
+    print(f"小时历史数据查询结果: {history_by_species}") # 测试输出
+    predict_row = _predict_all_species(history_by_species, target_time, _h12_predict_next_1h_points)
+
+    _mysqlinsert_12h_predict(
+        conn,
+        PREDICT_12H_RECORD_TABLE,
+        predict_row.values(),
+        predict_row.keys(),
+    )
+
+    _write_hourly_window_to_predict_input(conn, history_by_species, current_time, target_time)
+
+    if _should_retrain_today(current_time):
+        print("开始小时模型每日重训")
+        _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
+    else:
+        print("今日小时模型已训练，无需重训")
+
+
+def _run_7d_pipeline(conn, current_time):
+    """按配置执行 7d -> 1d 日预测链路。"""
+    if not ENABLE_7D_PREDICTION:
+        print("7d日预测未启用")
+        return
+    if current_time.hour != DAILY_PREDICTION_HOUR:
+        print(f"当前小时 {current_time.hour} 不是日预测执行小时 {DAILY_PREDICTION_HOUR}，跳过7d日预测")
+        return
+
+    target_day = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    print(f"日预测目标日期: {target_day}")
+    if _record_exists(conn, PREDICT_7D_RECORD_TABLE, target_day):
+        print(f"{target_day} 的日预测记录已存在，跳过7d日预测")
+        return
+
+    history_by_species, daily_rows, source_days = _build_daily_history(conn, target_day)
+    real_daily_days = 0
+    for day_offset in range(7):
+        day = (target_day - _timedelta(days=7 - day_offset)).date()
+        if day in source_days:
+            real_daily_days += 1
+    if real_daily_days < MIN_DAILY_SOURCE_DAYS:
+        print(f"日预测跳过：最近7个完整自然日真实数据只有 {real_daily_days} 天，少于 {MIN_DAILY_SOURCE_DAYS} 天")
+        return
+
+    _write_daily_train_rows(conn, daily_rows)
+
+    if _should_retrain_today(current_time, model_suffix="_d7"):
+        print("开始7d日模型每日重训")
+        trained = _read_7d_train_tab_to_train_model_fun(conn, TRAIN_7D_TABLE, NEED_PREDICT_BIO)
+        if not trained:
+            raise RuntimeError("7d日模型训练数据不足，无法完成日预测")
+
+    _validate_model_files(model_suffix="_d7")
+    predict_row = _predict_all_species(history_by_species, target_day, _d7_predict_next_1d_points)
+    _insert_row_if_missing(conn, PREDICT_7D_RECORD_TABLE, predict_row)
+    _write_daily_window_to_predict_input(conn, history_by_species, target_day)
+
+
+def _run_once():
+    # current_time = _get_current_hour() 
+    current_time = _datetime.strptime("2024-08-21 23:00:00", "%Y-%m-%d %H:%M:%S") # 测试用
+
     print(f"当前整点: {current_time}")
-    print(f"预测目标时间: {target_time}")
 
     _ensure_required_tables()
     conn = _connect_database()
     try:
-        _validate_model_files()
-
-        before_12h_times = _get_currenttime_before_12hour_fun(current_time)
-        history_by_species = _find_mysql_match_12h_data(
-            before_12h_times,
-            conn,
-            SOURCE_AVG_TABLE,
-            NEED_PREDICT_BIO,
-            CONCOMITANT_VARIABLES,
-        )
-
-        predict_row = _predict_all_species(history_by_species, target_time)
-
-        # Write only after every target species has produced a valid prediction.
-        _mysqlinsert_12h_predict(
-            conn,
-            PREDICT_12H_RECORD_TABLE,
-            predict_row.values(),
-            predict_row.keys(),
-        )
-
-        _write_h_data_to_train_tab(
-            current_time,
-            history_by_species,
-            conn,
-            TRAIN_12H_TABLE,
-            NEED_PREDICT_BIO,
-            CONCOMITANT_VARIABLES,
-            SOURCE_AVG_TABLE,
-        )
-
-        if _should_retrain_today(current_time):
-            print("开始每日模型重训")
-            _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
-        else:
-            print("今日模型已训练，无需重训")
+        _run_12h_pipeline(conn, current_time)
+        _run_7d_pipeline(conn, current_time)
     finally:
         conn.close()
 
@@ -206,7 +494,7 @@ if __name__ == "__main__":
     _sys.exit(_main())
 
 r"""
-Legacy exploratory code retained for reference only.
+以下为之前探索阶段代码，仅作参考，不参与当前正式入口执行。
 
 '''
 补充：每天训练一次

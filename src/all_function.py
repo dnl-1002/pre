@@ -269,8 +269,7 @@ def find_mysql_match_12h_data(current_time_before_12h_arr,datebase_conn,table_na
 
     # 构造 SQL 查询语句
     find_sql = f"""SELECT * FROM {table_name} WHERE SnapTime >= '{current_time_before_12h_arr[-1]}' 
-    AND SnapTime <= '{current_time_before_12h_arr[0]}' AND SummaryInterval=60"""
-    print(find_sql)
+    AND SnapTime <= '{current_time_before_12h_arr[0]}' AND SummaryInterval=60 AND DeviceID=1"""  
 
 
     # 使用 pandas 读取数据
