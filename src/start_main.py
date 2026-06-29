@@ -36,36 +36,38 @@ _os.chdir(_SCRIPT_DIR)
 
 
 #### 数据库配置。
-DATA_IP = "192.168.2.82"
-DATA_PORT = 3306
-DATA_USER = "root"
-DATA_PASSWORD = "root"
-DATA_NAME = "szsw"
+DATA_IP = "192.168.2.82" # 数据库 IP
+DATA_PORT = 3306 # 数据库端口
+DATA_USER = "root" # 数据库用户
+DATA_PASSWORD = "root" # 数据库密码
+DATA_NAME = "szsw" # 数据库名称
 
 
 #### 表配置。
-SOURCE_AVG_TABLE = "tab_biology_avg"
-TRAIN_12H_TABLE = "tab_train_12h"
-PREDICT_12H_RECORD_TABLE = "tab_predict_12h_record"
-PREDICT_12H_INPUT_TABLE = "tab_predict_12h_input_record"
-TRAIN_7D_TABLE = "tab_train_7d"
-PREDICT_7D_RECORD_TABLE = "tab_predict_7d_record"
-PREDICT_7D_INPUT_TABLE = "tab_predict_7d_input_record"
+SOURCE_AVG_TABLE = "tab_biology_avg"   # 雷工均值表，包含小时均值和日均值，按 SummaryInterval 区分
+TRAIN_12H_TABLE = "tab_train_12h"   # 小时训练表，存储小时预测训练数据
+PREDICT_12H_RECORD_TABLE = "tab_predict_12h_record"  # 小时预测记录表，存储小时预测结果
+PREDICT_12H_INPUT_TABLE = "tab_predict_12h_input_record" # 小时预测输入留痕表，存储小时预测使用的历史输入窗口数据
+TRAIN_7D_TABLE = "tab_train_7d" # 日训练表，存储日预测训练数据
+PREDICT_7D_RECORD_TABLE = "tab_predict_7d_record" # 日预测记录表，存储日预测结果
+PREDICT_7D_INPUT_TABLE = "tab_predict_7d_input_record" # 日预测输入留痕表，存储日预测使用的历史输入窗口数据
 
 
 #### 预测物种和协变量。
-NEED_PREDICT_BIO = ["Medusae", "Copepoda"]
-CONCOMITANT_VARIABLES = ["Temperature", "Salinity"]
+NEED_PREDICT_BIO = ["Medusae", "Copepoda"] # 需要预测的浮游生物物种
+CONCOMITANT_VARIABLES = ["Temperature", "Salinity"] # 协变量 温度 盐度
 
 
 #### 模型和运行配置。
-MODEL_DIR = "saved_models"
-ENABLE_TEST_TIME_OVERRIDE = False
-TEST_CURRENT_TIME = "2024-06-15 23:00:00"
-ENABLE_7D_PREDICTION = True
-DAILY_PREDICTION_HOUR = 0
-MIN_HOURLY_SOURCE_POINTS = 24
-MIN_DAILY_SOURCE_DAYS = 7
+MODEL_DIR = "saved_models"   # 模型保存目录
+ENABLE_TEST_TIME_OVERRIDE = True # 是否启用测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
+TEST_CURRENT_TIME = "2025-01-23 00:00:00" # 测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
+ENABLE_7D_PREDICTION = True # 是否启用日预测
+DAILY_PREDICTION_HOUR = 0 # 日预测执行小时，0 表示在每天的 0 点执行日预测
+HOURLY_MODEL_RETRAIN_HOUR = 23 # 小时模型每日固定重训小时，默认在每天最后一次小时调度时重训
+DAILY_MODEL_RETRAIN_HOUR = DAILY_PREDICTION_HOUR # 日模型每日固定重训小时，默认与日预测执行小时一致
+MIN_HOURLY_SOURCE_POINTS = 24 # 小时预测所需的最少源数据点数，当前整点前 24 小时真实数据不足则跳过小时预测
+MIN_DAILY_SOURCE_DAYS = 7 # 日预测所需的最少源数据天数，最近 7 个完整自然日真实数据不足则跳过日预测
 
 
 #### 建表字段。
@@ -161,15 +163,21 @@ def _has_missing_model_files(model_suffix=""):
 
 
 def _ensure_hourly_models_exist(conn):
-    """小时模型缺失时，先尝试训练，训练后再次校验模型文件。"""
+    """小时模型缺失时，先尝试训练；训练失败则优雅跳过小时预测。"""
     if not _has_missing_model_files():
-        return
+        return True
 
     print("小时模型文件缺失，开始先训练小时模型")
-    trained = _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
-    if trained is False:
-        raise RuntimeError("小时模型文件缺失，且训练数据不足，无法完成预测")
-    _validate_model_files()
+    try:
+        trained = _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
+        if trained is False:
+            print("警告：小时模型文件缺失，且训练数据不足，本次跳过小时预测")
+            return False
+        _validate_model_files()
+        return True
+    except Exception as error:
+        print(f"警告：小时模型缺失时兜底训练失败，本次跳过小时预测。错误信息: {error}")
+        return False
 
 
 def _should_retrain_today(current_time, model_suffix=""):
@@ -184,6 +192,13 @@ def _should_retrain_today(current_time, model_suffix=""):
             print(f"{bio_name} 模型日期为 {model_date}，早于当前日期 {current_date}，需要重训")
             return True
     return False
+
+
+def _should_retrain_at_fixed_hour(current_time, retrain_hour, model_suffix=""):
+    """只在固定小时执行每日重训判断，避免每个整点都触发重训逻辑。"""
+    if current_time.hour != retrain_hour:
+        return False
+    return _should_retrain_today(current_time, model_suffix)
 
 
 def _predict_all_species(history_by_species, target_time, predict_func):
@@ -302,10 +317,10 @@ def _write_recent_source_hours_to_train(conn):
 
 
 def _build_daily_history(conn, target_day):
-    """聚合日级数据：预测输入取最近 7 天，训练表使用源表全部历史日均值。"""
+    """读取源表日级数据：预测输入取最近 7 天，训练表使用源表全部历史日记录。"""
     start_day = target_day - _timedelta(days=7)
     find_sql = f"""SELECT * FROM {SOURCE_AVG_TABLE}
-    WHERE SnapTime < %s AND SummaryInterval=60 AND DeviceID=1"""
+    WHERE SnapTime < %s AND SummaryInterval=1 AND SummaryIntervalUnit='天' AND DeviceID=1"""
     # print(find_sql) # 测试查询输出
 
     df = _pd.read_sql(find_sql, conn, params=(target_day,))
@@ -334,22 +349,36 @@ def _build_daily_history(conn, target_day):
                 if column_name == 'SnapTime':
                     continue
                 if column_name in day_df.columns and not day_df.empty:
-                    value = _pd.to_numeric(day_df[column_name], errors='coerce').mean()
+                    value_series = _pd.to_numeric(day_df[column_name], errors='coerce').dropna()
+                    value = value_series.iloc[-1] if not value_series.empty else 0.0
                     daily_row[column_name] = 0.0 if _pd.isna(value) else float(value)
                 else:
                     daily_row[column_name] = 0.0
             daily_train_rows.append(daily_row)
             daily_row_by_day[day] = daily_row
 
-    for day_offset in range(7):
-        day = (start_day + _timedelta(days=day_offset)).date()
-        day_snap_time = _datetime.combine(day, _datetime.min.time())
-        daily_row = daily_row_by_day.get(day)
-        if daily_row is None:
-            daily_row = {'SnapTime': day_snap_time}
-            for column_name in TABLE_CREATE_COLUMNS:
-                if column_name != 'SnapTime':
-                    daily_row[column_name] = 0.0
+    # 日预测目标日为 T，模型输入严格使用不包含 T 当天的 7 天窗口：T-7 到 T-1。
+    target_index = _pd.date_range(start_day, last_history_day, freq='D')
+    if daily_train_rows:
+        window_df = _pd.DataFrame(daily_train_rows)
+    else:
+        window_df = _pd.DataFrame(columns=TABLE_CREATE_COLUMNS)
+    window_df['SnapTime'] = _pd.to_datetime(window_df['SnapTime'], errors='coerce')
+    window_df = window_df.dropna(subset=['SnapTime']).drop_duplicates(subset=['SnapTime'], keep='last')
+    for column_name in TABLE_CREATE_COLUMNS:
+        if column_name == 'SnapTime':
+            continue
+        if column_name not in window_df.columns:
+            window_df[column_name] = 0.0
+    window_df = window_df.set_index('SnapTime').reindex(target_index)
+    for column_name in TABLE_CREATE_COLUMNS:
+        if column_name == 'SnapTime':
+            continue
+        window_df[column_name] = _pd.to_numeric(window_df[column_name], errors='coerce')
+    window_df = window_df.interpolate(method='linear', limit_direction='both').ffill().bfill().fillna(0.0)
+
+    window_df = window_df.reset_index().rename(columns={'index': 'SnapTime'})
+    for _, daily_row in window_df.iterrows():
         for bio_name in NEED_PREDICT_BIO:
             history_by_species[bio_name]['y'].append(daily_row[bio_name])
             history_by_species[bio_name]['Temperature'].append(daily_row['Temperature'])
@@ -364,11 +393,11 @@ def _write_daily_train_rows(conn, daily_rows):
     inserted_count = 0
     for row_data in daily_rows:
         inserted_count += _insert_row_if_missing(conn, TRAIN_7D_TABLE, row_data)
-    print(f"7d训练表同步完成：源表历史日均值 {len(daily_rows)} 天，本次新增 {inserted_count} 天到 {TRAIN_7D_TABLE}")
+    print(f"7d训练表同步完成：源表历史日级记录 {len(daily_rows)} 天，本次新增 {inserted_count} 天到 {TRAIN_7D_TABLE}")
 
 
 def _write_daily_window_to_predict_input(conn, history_by_species, target_day):
-    """把本次日预测使用的 7 天输入窗口写入预测输入留痕表。"""
+    """把本次日预测使用的 7 天输入窗口写入预测输入留痕表，窗口为 T-7 到 T-1，不包含目标日 T。"""
     start_day = target_day - _timedelta(days=7)
     for index in range(7):
         snap_time = start_day + _timedelta(days=index)
@@ -405,7 +434,9 @@ def _run_12h_pipeline(conn, current_time):
     )
 
     _write_recent_source_hours_to_train(conn)
-    _ensure_hourly_models_exist(conn)
+    conn.commit()
+    if not _ensure_hourly_models_exist(conn):
+        return
 
     print(f"小时历史数据查询结果: {history_by_species}") # 测试输出
     predict_row = _predict_all_species(history_by_species, target_time, _h12_predict_next_1h_points)
@@ -419,11 +450,11 @@ def _run_12h_pipeline(conn, current_time):
 
     _write_hourly_window_to_predict_input(conn, history_by_species, current_time, target_time)
 
-    if _should_retrain_today(current_time):
+    if _should_retrain_at_fixed_hour(current_time, HOURLY_MODEL_RETRAIN_HOUR):
         print("开始小时模型每日重训")
         _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
     else:
-        print("今日小时模型已训练，无需重训")
+        print(f"当前不是小时模型固定重训小时 {HOURLY_MODEL_RETRAIN_HOUR}，或今日小时模型已训练，无需重训")
 
 
 def _run_7d_pipeline(conn, current_time):
@@ -453,7 +484,7 @@ def _run_7d_pipeline(conn, current_time):
 
     _write_daily_train_rows(conn, daily_rows)
 
-    if _should_retrain_today(current_time, model_suffix="_d7"):
+    if _should_retrain_at_fixed_hour(current_time, DAILY_MODEL_RETRAIN_HOUR, model_suffix="_d7"):
         print("开始7d日模型每日重训")
         trained = _read_7d_train_tab_to_train_model_fun(conn, TRAIN_7D_TABLE, NEED_PREDICT_BIO)
         if not trained:
@@ -466,8 +497,8 @@ def _run_7d_pipeline(conn, current_time):
 
 
 def _run_once():
-    # current_time = _get_current_hour() 
-    current_time = _datetime.strptime("2024-08-21 23:00:00", "%Y-%m-%d %H:%M:%S") # 测试用
+    current_time = _get_current_hour() # 当前整点
+    # current_time = _datetime.strptime("2024-08-21 23:00:00", "%Y-%m-%d %H:%M:%S") # 测试用
 
     print(f"当前整点: {current_time}")
 

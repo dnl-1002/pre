@@ -254,7 +254,7 @@ def get_currenttime_before_12hour_fun(currenttime):
         return_12hour_time_arr.append(temp_time_append)
     return return_12hour_time_arr
 
-####根据传入的时间数组去查询数据库，获取时间点对应的数据,如果没有查询到则补零，然后返回
+####根据传入的时间数组去查询数据库，获取时间点对应的数据；缺失时间点使用线性插值和前后填充，最后兜底补零
 def find_mysql_match_12h_data(current_time_before_12h_arr,datebase_conn,table_name,need_predict_bio_arr,concomitant_variable_bio_arr):
     '''
     返回目标值：
@@ -271,59 +271,39 @@ def find_mysql_match_12h_data(current_time_before_12h_arr,datebase_conn,table_na
     find_sql = f"""SELECT * FROM {table_name} WHERE SnapTime >= '{current_time_before_12h_arr[-1]}' 
     AND SnapTime <= '{current_time_before_12h_arr[0]}' AND SummaryInterval=60 AND DeviceID=1"""  
 
-
     # 使用 pandas 读取数据
     df = pd.read_sql(find_sql, datebase_conn)
-    all_time_arr = df['SnapTime'].tolist()
-    ###定义返回结果
+    target_times = sorted(pd.to_datetime(current_time_before_12h_arr))
+    target_index = pd.DatetimeIndex(target_times)
+    value_columns = list(dict.fromkeys(need_predict_bio_arr + concomitant_variable_bio_arr))
+
+    if 'SnapTime' not in df.columns:
+        df = pd.DataFrame(columns=['SnapTime'] + value_columns)
+    df['SnapTime'] = pd.to_datetime(df['SnapTime'], errors='coerce')
+    df = df.dropna(subset=['SnapTime']).sort_values('SnapTime')
+
+    for column_name in value_columns:
+        if column_name not in df.columns:
+            df[column_name] = 0.0
+
+    if df.empty:
+        window_df = pd.DataFrame(index=target_index, columns=value_columns)
+    else:
+        window_df = df[['SnapTime'] + value_columns].copy()
+        window_df = window_df.drop_duplicates(subset=['SnapTime'], keep='last')
+        window_df = window_df.set_index('SnapTime').reindex(target_index)
+
+    for column_name in value_columns:
+        window_df[column_name] = pd.to_numeric(window_df[column_name], errors='coerce')
+    window_df = window_df.interpolate(method='linear', limit_direction='both').ffill().bfill().fillna(0.0)
+
+    ###定义返回结果，顺序为从旧到新，保持模型输入与训练时间方向一致
     return_all_info_list = {}
-
-
-    ####物种丰度信息获取
     for bio_i in need_predict_bio_arr:
-        #####生物丰度值查询与补充
-        temp_signal_bio_list = {}
-        temp_bio_i_fd_arr = []
-        for time_i in current_time_before_12h_arr:
-            if time_i in all_time_arr:
-                try:
-                    row_index = df.isin([time_i]).any(axis=1)  # 判断哪些行包含目标值
-                    #print('单一值',time_i,bio_i,float(df.loc[row_index,bio_i]))
-                    temp_bio_i_fd_arr.append(float(df.loc[row_index,bio_i]))
-                except:
-                    ###如果报错，说明查询的物种不存在
-                    break
-            else:
-                ###如果部分时间数据没有，直接补零
-                temp_bio_i_fd_arr.append(0.0)
-                #print('@@@@@@@@@@@@@22',time_i)
-        temp_bio_i_fd_arr_reverse = list(reversed(temp_bio_i_fd_arr))
-        temp_signal_bio_list['y']=temp_bio_i_fd_arr_reverse
-        return_all_info_list[bio_i]=temp_signal_bio_list
-
-
-
-
-
-        ####协变量数组定义查询与补零
-        for num,concomitant_variable_i in enumerate(concomitant_variable_bio_arr):
-            temp_concomitant_variable_arr = []
-            for time_i in current_time_before_12h_arr:
-                if time_i in all_time_arr:
-                    try:
-                        row_index = df.isin([time_i]).any(axis=1)  # 判断哪些行包含目标值
-                        #print('协变量', time_i, bio_i, float(df.loc[row_index, concomitant_variable_i]))
-                        temp_concomitant_variable_arr.append(float(df.loc[row_index, concomitant_variable_i]))
-                    except:
-                        ###如果协变量查询报错，说明不存在协变量关键字
-                        temp_concomitant_variable_arr.append(0.0)
-                else:
-                    ###如果协变量部分时间不存在，则取插值
-                    temp_concomitant_variable_arr.append(0.0)
-            temp_concomitant_variable_arr_reverse = list(reversed(temp_concomitant_variable_arr))
-            temp_signal_bio_list[concomitant_variable_i] = temp_concomitant_variable_arr_reverse
-
-
+        temp_signal_bio_list = {'y': window_df[bio_i].astype(float).tolist()}
+        for concomitant_variable_i in concomitant_variable_bio_arr:
+            temp_signal_bio_list[concomitant_variable_i] = window_df[concomitant_variable_i].astype(float).tolist()
+        return_all_info_list[bio_i] = temp_signal_bio_list
 
     print(return_all_info_list)
     return return_all_info_list
