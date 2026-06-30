@@ -42,19 +42,19 @@
             0,
             1
         ],
-        "Salinity": [
+        "Temp": [
             0,
             1
         ],
-        "Temperature": [
+        "PH": [
             0,
             1
         ]
     },
     "t_cols": [
         "y",
-        "Temperature",
-        "Salinity",
+        "Temp",
+        "PH",
         "insample_mask",
         "outsample_mask"
     ],

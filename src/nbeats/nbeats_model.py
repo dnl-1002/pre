@@ -10,6 +10,24 @@ import os
 from utils.pytorch.ts_dataset import TimeSeriesDataset
 from utils.pytorch.ts_loader import TimeSeriesLoader
 
+
+def _prepare_exogenous_frame(historical_data, bio_i_str, time_index):
+    """根据 historical_data 中除 y 外的字段动态构建外生变量。"""
+    exogenous_columns = [key for key in historical_data.keys() if key != 'y']
+    if not exogenous_columns:
+        raise ValueError("预测数据中缺少协变量字段")
+
+    x_data = {
+        'unique_id': [bio_i_str] * len(time_index),
+        'ds': time_index,
+    }
+    for index, column_name in enumerate(exogenous_columns):
+        values = pd.to_numeric(pd.Series(historical_data[column_name]), errors='coerce').fillna(0.0)
+        if index == 1:
+            values = values - values.mean()
+        x_data[column_name] = values.tolist()
+    return pd.DataFrame(x_data)
+
 ####过去7d预测未来1d的值
 def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models'):
     """
@@ -19,16 +37,14 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
     historical_data: 字典，包含过去7个日级数据点，格式如下：
         {
             'y': [v1, v2, ..., v7],                 # 目标变量最近7天的值
-            'Temperature': [t1, t2, ..., t7],        # 温度最近7天的值
-            'Salinity': [s1, s2, ..., s7]            # 盐度最近7天的值
+            'Temp': [t1, t2, ..., t7],               # 温度最近7天的值
+            'PH': [p1, p2, ..., p7]                  # pH 最近7天的值
         }
     model_dir: 保存模型的目录路径
 
     返回:
     predictions: numpy数组，包含未来1个日级时间点的预测值
     """
-    Salinity_str = 'Salinity'
-    Temperature_str ='Temperature'
     try:
         # 1. 数据验证
         required_length = 7  # 需要的历史数据长度
@@ -40,9 +56,6 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
         model_path = os.path.join(model_dir, bio_i_str+'_d7_nbeats_model.pkl')
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
-        sal_mean = np.mean(historical_data[Salinity_str])
-        sal_centered = [x - sal_mean for x in historical_data[Salinity_str]]
-
         # 3. 准备数据
         # 创建时间索引
         current_time = pd.Timestamp.now()
@@ -56,12 +69,7 @@ def d7_predict_next_1d_points(historical_data,bio_i_str, model_dir='saved_models
         })
 
         # 创建X_df
-        X_df = pd.DataFrame({
-            'unique_id': [bio_i_str] * required_length,
-            'ds': time_index,
-            Temperature_str: historical_data[Temperature_str],
-            Salinity_str: sal_centered
-        })
+        X_df = _prepare_exogenous_frame(historical_data, bio_i_str, time_index)
 
         # 4. 创建数据集和加载器
         ts_dataset = TimeSeriesDataset(
@@ -107,16 +115,14 @@ def h12_predict_next_1h_points(historical_data,bio_i_str, model_dir='saved_model
     historical_data: 字典，包含过去12个点的数据，格式如下：
         {
             'y': [v1, v2, ..., v12],        # 目标变量(桡足类)最近12个点的值
-            'Temp_C': [t1, t2, ..., t12],   # 温度最近12个点的值
-            'Sal': [s1, s2, ..., s12]       # 盐度最近12个点的值
+            'Temp': [t1, t2, ..., t12],     # 温度最近12个点的值
+            'PH': [p1, p2, ..., p12]        # pH 最近12个点的值
         }
     model_dir: 保存模型的目录路径
 
     返回:
     predictions: numpy数组，包含未来2个时间点的预测值
     """
-    Salinity_str = 'Salinity'
-    Temperature_str ='Temperature'
     try:
         # 1. 数据验证
         required_length = 12  # 需要的历史数据长度
@@ -128,9 +134,6 @@ def h12_predict_next_1h_points(historical_data,bio_i_str, model_dir='saved_model
         model_path = os.path.join(model_dir, bio_i_str+'_nbeats_model.pkl')
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
-        sal_mean = np.mean(historical_data[Salinity_str])
-        sal_centered = [x - sal_mean for x in historical_data[Salinity_str]]
-
         # 3. 准备数据
         # 创建时间索引
         current_time = pd.Timestamp.now()
@@ -144,12 +147,7 @@ def h12_predict_next_1h_points(historical_data,bio_i_str, model_dir='saved_model
         })
 
         # 创建X_df
-        X_df = pd.DataFrame({
-            'unique_id': [bio_i_str] * required_length,
-            'ds': time_index,
-            Temperature_str: historical_data[Temperature_str],
-            Salinity_str: sal_centered
-        })
+        X_df = _prepare_exogenous_frame(historical_data, bio_i_str, time_index)
 
         # 4. 创建数据集和加载器
         ts_dataset = TimeSeriesDataset(

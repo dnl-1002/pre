@@ -1,5 +1,5 @@
 {
-    "input_size_multiplier": 7,
+    "input_size_multiplier": 12,
     "output_size": 1,
     "shared_weights": false,
     "initialization": "glorot_normal",
@@ -42,19 +42,19 @@
             0,
             1
         ],
-        "Salinity": [
+        "Temp": [
             0,
             1
         ],
-        "Temperature": [
+        "PH": [
             0,
             1
         ]
     },
     "t_cols": [
         "y",
-        "Temperature",
-        "Salinity",
+        "Temp",
+        "PH",
         "insample_mask",
         "outsample_mask"
     ],
@@ -67,7 +67,7 @@
     "early_stopping": 300,
     "weight_decay": 0,
     "l1_theta": 0,
-    "n_iterations": 100,
+    "n_iterations": 500,
     "loss": "MAE",
     "loss_hypar": 1,
     "val_loss": "MAE",

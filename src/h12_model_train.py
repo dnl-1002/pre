@@ -70,7 +70,7 @@ def save_model_and_params(model,train_model_bio_i, save_dir='saved_models', mode
         'n_harmonics': 1,
         'n_polynomials': 100,
         'x_s_n_hidden': 0,
-        'exogenous_n_channels': 2,
+        'exogenous_n_channels': len([key for key in model.include_var_dict.keys() if key != 'y']),
         'include_var_dict': model.include_var_dict,  # 从模型获取
         't_cols': model.t_cols,  # 从模型获取
         'batch_normalization': True,
@@ -105,7 +105,9 @@ def save_model_and_params(model,train_model_bio_i, save_dir='saved_models', mode
 
     return model_config
 
-def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_predict_bio_arr):
+def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_predict_bio_arr,concomitant_variable_arr=None):
+    if concomitant_variable_arr is None:
+        concomitant_variable_arr = ['Temp', 'PH']
     # 读取整个表
     query = f"SELECT * FROM {tab_train_12h_name}"
     h12_all_train_data = pd.read_sql(query, datebase_conn)
@@ -132,9 +134,11 @@ def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_
         # 添加 unique_id 列和 ds 列
         X_df['unique_id'] = [train_model_bio_i] * len(timestamps)  # 确保 unique_id 列正确填充
         X_df['ds'] = timestamps  # 添加时间戳列
-        X_df['Temperature'] = data['Temperature']
-        print('@@@103',type(data['Salinity']), data['Salinity'])
-        X_df['Salinity'] = data['Salinity'] - data['Salinity'].mean()
+        for index, variable_name in enumerate(concomitant_variable_arr):
+            variable_data = pd.to_numeric(data[variable_name], errors='coerce').fillna(0.0)
+            if index == 1:
+                variable_data = variable_data - variable_data.mean()
+            X_df[variable_name] = variable_data
 
 
         # 打印结果
@@ -173,7 +177,9 @@ def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_
                                       is_train_loader=False,
                                       shuffle=False)
         # # 包含滞后的字典
-        include_var_dict = {'y': [0, 1], 'Salinity': [0, 1], 'Temperature': [0, 1]}
+        include_var_dict = {'y': [0, 1]}
+        for variable_name in concomitant_variable_arr:
+            include_var_dict[variable_name] = [0, 1]
         # 确保外生变量的名字与数据中的列名匹配
         #
         # 初始化模型
@@ -189,7 +195,7 @@ def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_
                        n_harmonics=1,
                        n_polynomials=0,
                        x_s_n_hidden=0,
-                       exogenous_n_channels=2,
+                       exogenous_n_channels=len(concomitant_variable_arr),
                        include_var_dict=include_var_dict,
                        t_cols=ts_dataset.t_cols,
                        batch_normalization=True,
@@ -217,10 +223,12 @@ def read_12h_train_tab_to_train_model_fun(datebase_conn,tab_train_12h_name,need_
     return True
 
 
-def read_7d_train_tab_to_train_model_fun(datebase_conn, tab_train_7d_name, need_predict_bio_arr):
+def read_7d_train_tab_to_train_model_fun(datebase_conn, tab_train_7d_name, need_predict_bio_arr, concomitant_variable_arr=None):
+    if concomitant_variable_arr is None:
+        concomitant_variable_arr = ['Temp', 'PH']
     """
     从日级训练表训练 7d -> 1d 模型。
-    日级训练表字段沿用 SnapTime、物种字段、Temperature、Salinity。
+    日级训练表字段沿用 SnapTime、物种字段和配置的协变量字段。
     """
     query = f"SELECT * FROM {tab_train_7d_name}"
     d7_all_train_data = pd.read_sql(query, datebase_conn)
@@ -242,9 +250,11 @@ def read_7d_train_tab_to_train_model_fun(datebase_conn, tab_train_7d_name, need_
         X_df = pd.DataFrame()
         X_df['unique_id'] = [train_model_bio_i] * len(timestamps)
         X_df['ds'] = timestamps
-        X_df['Temperature'] = pd.to_numeric(data['Temperature'], errors='coerce').fillna(0.0)
-        salinity = pd.to_numeric(data['Salinity'], errors='coerce').fillna(0.0)
-        X_df['Salinity'] = salinity - salinity.mean()
+        for index, variable_name in enumerate(concomitant_variable_arr):
+            variable_data = pd.to_numeric(data[variable_name], errors='coerce').fillna(0.0)
+            if index == 1:
+                variable_data = variable_data - variable_data.mean()
+            X_df[variable_name] = variable_data
 
         train_mask = np.ones(len(Y_df))
         train_mask[-7:] = 0
@@ -273,7 +283,9 @@ def read_7d_train_tab_to_train_model_fun(datebase_conn, tab_train_7d_name, need_
                                       is_train_loader=False,
                                       shuffle=False)
 
-        include_var_dict = {'y': [0, 1], 'Salinity': [0, 1], 'Temperature': [0, 1]}
+        include_var_dict = {'y': [0, 1]}
+        for variable_name in concomitant_variable_arr:
+            include_var_dict[variable_name] = [0, 1]
         model = Nbeats(input_size_multiplier=7,
                        output_size=1,
                        shared_weights=False,
@@ -286,7 +298,7 @@ def read_7d_train_tab_to_train_model_fun(datebase_conn, tab_train_7d_name, need_
                        n_harmonics=1,
                        n_polynomials=0,
                        x_s_n_hidden=0,
-                       exogenous_n_channels=2,
+                       exogenous_n_channels=len(concomitant_variable_arr),
                        include_var_dict=include_var_dict,
                        t_cols=ts_dataset.t_cols,
                        batch_normalization=True,

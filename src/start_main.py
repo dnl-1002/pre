@@ -12,6 +12,7 @@
 """
 
 import os as _os
+import json as _json
 import sys as _sys
 import traceback as _traceback
 from datetime import datetime as _datetime, timedelta as _timedelta
@@ -19,7 +20,6 @@ from datetime import datetime as _datetime, timedelta as _timedelta
 import pandas as _pd
 
 from all_function import (
-    find_mysql_match_12h_data as _find_mysql_match_12h_data,
     get_currenttime_before_12hour_fun as _get_currenttime_before_12hour_fun,
 )
 from h12_model_train import read_12h_train_tab_to_train_model_fun as _read_12h_train_tab_to_train_model_fun
@@ -40,11 +40,12 @@ DATA_IP = "192.168.2.82" # 数据库 IP
 DATA_PORT = 3306 # 数据库端口
 DATA_USER = "root" # 数据库用户
 DATA_PASSWORD = "root" # 数据库密码
-DATA_NAME = "szsw" # 数据库名称
+DATA_NAME = "szsw_plant" # 数据库名称
 
 
 #### 表配置。
 SOURCE_AVG_TABLE = "tab_biology_avg"   # 雷工均值表，包含小时均值和日均值，按 SummaryInterval 区分
+WATER_QUALITY_TABLE = "tab_waterqualityrecord" # 水质记录表，按 StatusTime 对齐协变量
 TRAIN_12H_TABLE = "tab_train_12h"   # 小时训练表，存储小时预测训练数据
 PREDICT_12H_RECORD_TABLE = "tab_predict_12h_record"  # 小时预测记录表，存储小时预测结果
 PREDICT_12H_INPUT_TABLE = "tab_predict_12h_input_record" # 小时预测输入留痕表，存储小时预测使用的历史输入窗口数据
@@ -54,16 +55,18 @@ PREDICT_7D_INPUT_TABLE = "tab_predict_7d_input_record" # 日预测输入留痕�
 
 
 #### 预测物种和协变量。
-NEED_PREDICT_BIO = ["Medusae", "Copepoda"] # 需要预测的浮游生物物种
-CONCOMITANT_VARIABLES = ["Temperature", "Salinity"] # 协变量 温度 盐度
+NEED_PREDICT_BIO = ["copepodadensity"] # 需要预测的浮游生物物种
+CONCOMITANT_VARIABLES = ["Temp", "PH"] # 协变量 温度 和 pH
+BIOLOGY_DEVICE_ID = 7 # 生物均值表查询设备
+WATER_QUALITY_DEVICE_ID = 7 # 水质表查询设备
 
 
 #### 模型和运行配置。
 MODEL_DIR = "saved_models"   # 模型保存目录
 ENABLE_TEST_TIME_OVERRIDE = True # 是否启用测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
-TEST_CURRENT_TIME = "2025-01-23 00:00:00" # 测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
+TEST_CURRENT_TIME = "2026-06-30 15:00:00" # 测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
 ENABLE_7D_PREDICTION = True # 是否启用日预测
-DAILY_PREDICTION_HOUR = 0 # 日预测执行小时，0 表示在每天的 0 点执行日预测
+DAILY_PREDICTION_HOUR = 13 # 日预测执行小时，0 表示在每天的 0 点执行日预测
 HOURLY_MODEL_RETRAIN_HOUR = 23 # 小时模型每日固定重训小时，默认在每天最后一次小时调度时重训
 DAILY_MODEL_RETRAIN_HOUR = DAILY_PREDICTION_HOUR # 日模型每日固定重训小时，默认与日预测执行小时一致
 MIN_HOURLY_SOURCE_POINTS = 24 # 小时预测所需的最少源数据点数，当前整点前 24 小时真实数据不足则跳过小时预测
@@ -71,20 +74,9 @@ MIN_DAILY_SOURCE_DAYS = 7 # 日预测所需的最少源数据天数，最近 7 �
 
 
 #### 建表字段。
-TABLE_CREATE_COLUMNS = [
-    "SnapTime",
-    "Chaetognatha",
-    "Medusae",
-    "Echinodermata",
-    "Shrimp",
-    "Copepoda",
-    "Appendicularia",
-    "Noctiluca",
-    "Temperature",
-    "Salinity",
-]
+TABLE_CREATE_COLUMNS = ["SnapTime"] + NEED_PREDICT_BIO + CONCOMITANT_VARIABLES
 
-PREDICT_12H_INPUT_COLUMNS = ["PredictSnapTime"] + TABLE_CREATE_COLUMNS
+PREDICT_12H_INPUT_COLUMNS = ["PredictSnapTime"] + TABLE_CREATE_COLUMNS 
 PREDICT_7D_INPUT_COLUMNS = ["PredictSnapTime"] + TABLE_CREATE_COLUMNS
 
 
@@ -142,24 +134,79 @@ def _connect_database():
     return _mysqlConnect(DATA_IP, DATA_PORT, DATA_USER, DATA_PASSWORD, DATA_NAME)
 
 
+def _ensure_columns_exist(conn, table_name, columns):
+    """只给目标表补缺失字段，不修改任何源数据表。"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+        existing_columns = {row[0] for row in cursor.fetchall()}
+        for column_name in columns:
+            if column_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN `{column_name}` VARCHAR(40)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+def _ensure_target_table_columns(conn):
+    """确保训练表、预测表、输入留痕表包含当前业务需要的字段。"""
+    _ensure_columns_exist(conn, TRAIN_12H_TABLE, TABLE_CREATE_COLUMNS)
+    _ensure_columns_exist(conn, PREDICT_12H_RECORD_TABLE, TABLE_CREATE_COLUMNS)
+    _ensure_columns_exist(conn, PREDICT_12H_INPUT_TABLE, PREDICT_12H_INPUT_COLUMNS)
+    _ensure_columns_exist(conn, TRAIN_7D_TABLE, TABLE_CREATE_COLUMNS)
+    _ensure_columns_exist(conn, PREDICT_7D_RECORD_TABLE, TABLE_CREATE_COLUMNS)
+    _ensure_columns_exist(conn, PREDICT_7D_INPUT_TABLE, PREDICT_7D_INPUT_COLUMNS)
+
+
 def _model_path(bio_name, model_suffix=""):
     return _os.path.join(MODEL_DIR, f"{bio_name}{model_suffix}_nbeats_model.pkl")
 
 
+def _model_params_path(bio_name, model_suffix=""):
+    return _os.path.join(MODEL_DIR, f"{bio_name}{model_suffix}_model_params.json")
+
+
+def _model_uses_current_variables(bio_name, model_suffix=""):
+    """检查模型参数中的协变量是否与当前配置一致。"""
+    params_path = _model_params_path(bio_name, model_suffix)
+    if not _os.path.exists(params_path):
+        return False
+    try:
+        with open(params_path, 'r', encoding='utf-8') as params_file:
+            model_config = _json.load(params_file)
+        include_var_dict = model_config.get('include_var_dict', {})
+        model_variables = [key for key in include_var_dict.keys() if key != 'y']
+        return model_variables == CONCOMITANT_VARIABLES
+    except Exception:
+        return False
+
+
 def _validate_model_files(model_suffix=""):
-    """预测前校验目标物种模型文件是否存在。"""
+    """预测前校验目标物种模型文件是否存在且协变量配置匹配。"""
     missing_models = []
+    incompatible_models = []
     for bio_name in NEED_PREDICT_BIO:
         model_path = _model_path(bio_name, model_suffix)
         if not _os.path.exists(model_path):
             missing_models.append(model_path)
+        elif not _model_uses_current_variables(bio_name, model_suffix):
+            incompatible_models.append(model_path)
     if missing_models:
         raise FileNotFoundError("缺少模型文件: " + ", ".join(missing_models))
+    if incompatible_models:
+        raise RuntimeError("模型协变量配置已失效，需要重新训练: " + ", ".join(incompatible_models))
 
 
 def _has_missing_model_files(model_suffix=""):
-    """判断是否存在缺失的目标物种模型文件。"""
-    return any(not _os.path.exists(_model_path(bio_name, model_suffix)) for bio_name in NEED_PREDICT_BIO)
+    """判断是否存在缺失或协变量配置失效的目标物种模型文件。"""
+    return any(
+        not _os.path.exists(_model_path(bio_name, model_suffix))
+        or not _model_uses_current_variables(bio_name, model_suffix)
+        for bio_name in NEED_PREDICT_BIO
+    )
 
 
 def _ensure_hourly_models_exist(conn):
@@ -169,7 +216,7 @@ def _ensure_hourly_models_exist(conn):
 
     print("小时模型文件缺失，开始先训练小时模型")
     try:
-        trained = _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
+        trained = _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO, CONCOMITANT_VARIABLES)
         if trained is False:
             print("警告：小时模型文件缺失，且训练数据不足，本次跳过小时预测")
             return False
@@ -180,12 +227,33 @@ def _ensure_hourly_models_exist(conn):
         return False
 
 
+def _ensure_daily_models_exist(conn):
+    """日模型缺失或协变量失效时，先尝试训练；训练失败则优雅跳过日预测。"""
+    if not _has_missing_model_files(model_suffix="_d7"):
+        return True
+
+    print("7d日模型文件缺失或协变量配置失效，开始先训练日模型")
+    try:
+        trained = _read_7d_train_tab_to_train_model_fun(conn, TRAIN_7D_TABLE, NEED_PREDICT_BIO, CONCOMITANT_VARIABLES)
+        if trained is False:
+            print("警告：7d日模型训练数据不足，本次跳过日预测")
+            return False
+        _validate_model_files(model_suffix="_d7")
+        return True
+    except Exception as error:
+        print(f"警告：7d日模型兜底训练失败，本次跳过日预测。错误信息: {error}")
+        return False
+
+
 def _should_retrain_today(current_time, model_suffix=""):
     """任一目标物种模型文件早于当前日期时，触发每日重训。"""
     current_date = current_time.date()
     for bio_name in NEED_PREDICT_BIO:
         model_path = _model_path(bio_name, model_suffix)
         if not _os.path.exists(model_path):
+            return True
+        if not _model_uses_current_variables(bio_name, model_suffix):
+            print(f"{bio_name} 模型协变量配置与当前 {CONCOMITANT_VARIABLES} 不一致，需要重训")
             return True
         model_date = _datetime.fromtimestamp(_os.path.getmtime(model_path)).date()
         if model_date < current_date:
@@ -261,18 +329,114 @@ def _record_exists(conn, table_name, snap_time):
         cursor.close()
 
 
+def _get_latest_snap_time(conn, table_name):
+    """读取目标训练表中最新的 SnapTime，用于增量同步。"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SELECT MAX(SnapTime) FROM {table_name}")
+        result = cursor.fetchone()
+        if not result or result[0] is None:
+            return None
+        latest_time = _pd.to_datetime(result[0], errors='coerce')
+        if _pd.isna(latest_time):
+            return None
+        return latest_time.to_pydatetime()
+    finally:
+        cursor.close()
+
+
+def _normalize_time_window(df, time_column, target_index, value_columns):
+    """按目标时间轴补齐数值列，缺失值使用插值和前后填充。"""
+    if time_column not in df.columns:
+        df = _pd.DataFrame(columns=[time_column] + value_columns)
+    df[time_column] = _pd.to_datetime(df[time_column], errors='coerce')
+    df = df.dropna(subset=[time_column]).sort_values(time_column)
+
+    for column_name in value_columns:
+        if column_name not in df.columns:
+            df[column_name] = 0.0
+
+    if df.empty:
+        window_df = _pd.DataFrame(index=target_index, columns=value_columns)
+    else:
+        window_df = df[[time_column] + value_columns].copy()
+        window_df = window_df.drop_duplicates(subset=[time_column], keep='last')
+        window_df = window_df.set_index(time_column).reindex(target_index)
+
+    for column_name in value_columns:
+        window_df[column_name] = _pd.to_numeric(window_df[column_name], errors='coerce')
+    return window_df.interpolate(method='linear', limit_direction='both').ffill().bfill().fillna(0.0)
+
+
+def _read_water_quality_means(conn, target_index, freq):
+    """从水质表只读查询，并按小时或自然日聚合协变量均值。"""
+    if len(target_index) == 0:
+        return _pd.DataFrame(index=target_index, columns=CONCOMITANT_VARIABLES).fillna(0.0)
+
+    start_time = target_index.min()
+    if freq == 'H':
+        end_time = target_index.max() + _timedelta(hours=1)
+    else:
+        end_time = target_index.max() + _timedelta(days=1)
+
+    columns_sql = ", ".join(["StatusTime"] + CONCOMITANT_VARIABLES)
+    sql = f"""SELECT {columns_sql} FROM {WATER_QUALITY_TABLE}
+    WHERE StatusTime >= %s AND StatusTime < %s AND DeviceID=%s"""
+    df = _pd.read_sql(sql, conn, params=(start_time, end_time, WATER_QUALITY_DEVICE_ID))
+    if 'StatusTime' not in df.columns:
+        df = _pd.DataFrame(columns=['StatusTime'] + CONCOMITANT_VARIABLES)
+    df['StatusTime'] = _pd.to_datetime(df['StatusTime'], errors='coerce')
+    df = df.dropna(subset=['StatusTime'])
+    for column_name in CONCOMITANT_VARIABLES:
+        if column_name not in df.columns:
+            df[column_name] = 0.0
+        df[column_name] = _pd.to_numeric(df[column_name], errors='coerce')
+
+    if df.empty:
+        grouped = _pd.DataFrame(columns=['SnapTime'] + CONCOMITANT_VARIABLES)
+    else:
+        df['SnapTime'] = df['StatusTime'].dt.floor(freq)
+        grouped = df.groupby('SnapTime', as_index=False)[CONCOMITANT_VARIABLES].mean()
+
+    return _normalize_time_window(grouped, 'SnapTime', target_index, CONCOMITANT_VARIABLES)
+
+
 def _count_recent_hourly_points(conn, current_time):
     """统计当前整点前 24 小时源表中真实存在的小时记录数。"""
     start_time = current_time - _timedelta(hours=23)
     sql = f"""SELECT COUNT(DISTINCT SnapTime) FROM {SOURCE_AVG_TABLE}
-    WHERE SnapTime >= %s AND SnapTime <= %s AND SummaryInterval=60 AND DeviceID=1"""
+    WHERE SnapTime >= %s AND SnapTime <= %s AND SummaryInterval=60 AND DeviceID=%s"""
     cursor = conn.cursor()
     try:
-        cursor.execute(sql, (start_time, current_time))
+        cursor.execute(sql, (start_time, current_time, BIOLOGY_DEVICE_ID))
         result = cursor.fetchone()
         return int(result[0]) if result and result[0] is not None else 0
     finally:
         cursor.close()
+
+
+def _build_hourly_history(conn, before_12h_times):
+    """构建小时预测输入：生物值来自生物表，协变量来自水质表按小时均值。"""
+    target_times = sorted(_pd.to_datetime(before_12h_times))
+    target_index = _pd.DatetimeIndex(target_times)
+    start_time = target_index.min()
+    end_time = target_index.max()
+
+    columns_sql = ", ".join(["SnapTime"] + NEED_PREDICT_BIO)
+    find_sql = f"""SELECT {columns_sql} FROM {SOURCE_AVG_TABLE}
+    WHERE SnapTime >= %s AND SnapTime <= %s AND SummaryInterval=60 AND DeviceID=%s"""
+    biology_df = _pd.read_sql(find_sql, conn, params=(start_time, end_time, BIOLOGY_DEVICE_ID))
+    biology_window = _normalize_time_window(biology_df, 'SnapTime', target_index, NEED_PREDICT_BIO)
+    water_window = _read_water_quality_means(conn, target_index, freq='H')
+
+    history_by_species = {}
+    for bio_name in NEED_PREDICT_BIO:
+        species_history = {'y': biology_window[bio_name].astype(float).tolist()}
+        for variable_name in CONCOMITANT_VARIABLES:
+            species_history[variable_name] = water_window[variable_name].astype(float).tolist()
+        history_by_species[bio_name] = species_history
+
+    return history_by_species
 
 
 def _write_hourly_window_to_predict_input(conn, history_by_species, current_time, target_time):
@@ -293,51 +457,69 @@ def _write_hourly_window_to_predict_input(conn, history_by_species, current_time
 
 
 def _write_recent_source_hours_to_train(conn):
-    """同步源表全部小时历史数据到小时训练表，缺失整点由训练阶段插值补齐。"""
-    find_sql = f"""SELECT * FROM {SOURCE_AVG_TABLE}
-    WHERE SummaryInterval=60 AND DeviceID=1"""
-    df = _pd.read_sql(find_sql, conn)
+    """增量同步小时生物历史数据到训练表，协变量按水质小时均值对齐。"""
+    latest_train_time = _get_latest_snap_time(conn, TRAIN_12H_TABLE)
+    columns_sql = ", ".join(["SnapTime"] + NEED_PREDICT_BIO)
+    find_sql = f"""SELECT {columns_sql} FROM {SOURCE_AVG_TABLE}
+    WHERE SummaryInterval=60 AND DeviceID=%s"""
+    params = [BIOLOGY_DEVICE_ID]
+    if latest_train_time is not None:
+        find_sql += " AND SnapTime > %s"
+        params.append(latest_train_time)
+    df = _pd.read_sql(find_sql, conn, params=tuple(params))
     if 'SnapTime' not in df.columns:
         return
     df['SnapTime'] = _pd.to_datetime(df['SnapTime'], errors='coerce')
     df = df.dropna(subset=['SnapTime']).sort_values('SnapTime')
+    if df.empty:
+        print("小时训练表同步跳过：没有新的小时源数据")
+        return
+
+    target_index = _pd.DatetimeIndex(df['SnapTime'].drop_duplicates().sort_values())
+    water_window = _read_water_quality_means(conn, target_index, freq='H')
 
     inserted_count = 0
     for _, source_row in df.iterrows():
         snap_time = source_row['SnapTime']
         row_data = {'SnapTime': snap_time.to_pydatetime()}
-        for column_name in TABLE_CREATE_COLUMNS:
-            if column_name == 'SnapTime':
-                continue
-            if column_name in df.columns:
-                value = _pd.to_numeric(_pd.Series([source_row[column_name]]), errors='coerce').iloc[0]
-                row_data[column_name] = 0.0 if _pd.isna(value) else float(value)
+        for bio_name in NEED_PREDICT_BIO:
+            value = _pd.to_numeric(_pd.Series([source_row.get(bio_name)]), errors='coerce').iloc[0]
+            row_data[bio_name] = 0.0 if _pd.isna(value) else float(value)
+        for variable_name in CONCOMITANT_VARIABLES:
+            row_data[variable_name] = float(water_window.loc[snap_time, variable_name])
         inserted_count += _insert_row_if_missing(conn, TRAIN_12H_TABLE, row_data)
-    print(f"小时训练表同步完成：源表小时历史数据 {len(df)} 条，本次新增 {inserted_count} 条到 {TRAIN_12H_TABLE}")
+    print(f"小时训练表增量同步完成：查询到新小时数据 {len(df)} 条，本次新增 {inserted_count} 条到 {TRAIN_12H_TABLE}")
 
 
 def _build_daily_history(conn, target_day):
-    """读取源表日级数据：预测输入取最近 7 天，训练表使用源表全部历史日记录。"""
+    """读取 T-7 到 T-1 的日级预测输入，协变量按水质自然日均值对齐。"""
     start_day = target_day - _timedelta(days=7)
-    find_sql = f"""SELECT * FROM {SOURCE_AVG_TABLE}
-    WHERE SnapTime < %s AND SummaryInterval=1 AND SummaryIntervalUnit='天' AND DeviceID=1"""
+    columns_sql = ", ".join(["SnapTime"] + NEED_PREDICT_BIO)
+    find_sql = f"""SELECT {columns_sql} FROM {SOURCE_AVG_TABLE}
+    WHERE SnapTime >= %s AND SnapTime < %s AND SummaryInterval=1 AND SummaryIntervalUnit='天' AND DeviceID=%s"""
     # print(find_sql) # 测试查询输出
 
-    df = _pd.read_sql(find_sql, conn, params=(target_day,))
+    df = _pd.read_sql(find_sql, conn, params=(start_day, target_day, BIOLOGY_DEVICE_ID))
     if 'SnapTime' in df.columns:
         df['SnapTime'] = _pd.to_datetime(df['SnapTime'], errors='coerce')
         df = df.dropna(subset=['SnapTime'])
         df['Day'] = df['SnapTime'].dt.date
 
     history_by_species = {
-        bio_name: {'y': [], 'Temperature': [], 'Salinity': []}
+        bio_name: {'y': []}
         for bio_name in NEED_PREDICT_BIO
     }
-    daily_train_rows = []
-    daily_row_by_day = {}
+    for bio_name in NEED_PREDICT_BIO:
+        for variable_name in CONCOMITANT_VARIABLES:
+            history_by_species[bio_name][variable_name] = []
+
+    daily_rows = []
     source_days = set(df['Day'].dropna().tolist()) if 'Day' in df.columns else set()
 
     last_history_day = (target_day - _timedelta(days=1)).date()
+    if 'Day' in df.columns and not df.empty:
+        full_daily_index = _pd.date_range(start_day, last_history_day, freq='D')
+        water_window = _read_water_quality_means(conn, full_daily_index, freq='D')
 
     if 'Day' in df.columns and not df.empty:
         for day, day_df in df.groupby('Day'):
@@ -345,22 +527,18 @@ def _build_daily_history(conn, target_day):
                 continue
             day_snap_time = _datetime.combine(day, _datetime.min.time())
             daily_row = {'SnapTime': day_snap_time}
-            for column_name in TABLE_CREATE_COLUMNS:
-                if column_name == 'SnapTime':
-                    continue
-                if column_name in day_df.columns and not day_df.empty:
-                    value_series = _pd.to_numeric(day_df[column_name], errors='coerce').dropna()
-                    value = value_series.iloc[-1] if not value_series.empty else 0.0
-                    daily_row[column_name] = 0.0 if _pd.isna(value) else float(value)
-                else:
-                    daily_row[column_name] = 0.0
-            daily_train_rows.append(daily_row)
-            daily_row_by_day[day] = daily_row
+            for bio_name in NEED_PREDICT_BIO:
+                value_series = _pd.to_numeric(day_df[bio_name], errors='coerce').dropna() if bio_name in day_df.columns else _pd.Series(dtype=float)
+                value = value_series.iloc[-1] if not value_series.empty else 0.0
+                daily_row[bio_name] = 0.0 if _pd.isna(value) else float(value)
+            for variable_name in CONCOMITANT_VARIABLES:
+                daily_row[variable_name] = float(water_window.loc[day_snap_time, variable_name])
+            daily_rows.append(daily_row)
 
     # 日预测目标日为 T，模型输入严格使用不包含 T 当天的 7 天窗口：T-7 到 T-1。
     target_index = _pd.date_range(start_day, last_history_day, freq='D')
-    if daily_train_rows:
-        window_df = _pd.DataFrame(daily_train_rows)
+    if daily_rows:
+        window_df = _pd.DataFrame(daily_rows)
     else:
         window_df = _pd.DataFrame(columns=TABLE_CREATE_COLUMNS)
     window_df['SnapTime'] = _pd.to_datetime(window_df['SnapTime'], errors='coerce')
@@ -381,11 +559,11 @@ def _build_daily_history(conn, target_day):
     for _, daily_row in window_df.iterrows():
         for bio_name in NEED_PREDICT_BIO:
             history_by_species[bio_name]['y'].append(daily_row[bio_name])
-            history_by_species[bio_name]['Temperature'].append(daily_row['Temperature'])
-            history_by_species[bio_name]['Salinity'].append(daily_row['Salinity'])
+            for variable_name in CONCOMITANT_VARIABLES:
+                history_by_species[bio_name][variable_name].append(daily_row[variable_name])
 
     # print(f"日级历史数据: {history_by_species}") # 测试输出
-    return history_by_species, daily_train_rows, source_days
+    return history_by_species, source_days
 
 
 def _write_daily_train_rows(conn, daily_rows):
@@ -393,7 +571,44 @@ def _write_daily_train_rows(conn, daily_rows):
     inserted_count = 0
     for row_data in daily_rows:
         inserted_count += _insert_row_if_missing(conn, TRAIN_7D_TABLE, row_data)
-    print(f"7d训练表同步完成：源表历史日级记录 {len(daily_rows)} 天，本次新增 {inserted_count} 天到 {TRAIN_7D_TABLE}")
+    print(f"7d训练表增量同步完成：查询到新日级记录 {len(daily_rows)} 天，本次新增 {inserted_count} 天到 {TRAIN_7D_TABLE}")
+
+
+def _write_incremental_daily_source_to_train(conn, target_day):
+    """增量同步日级生物数据到 7d 训练表，协变量按水质自然日均值对齐。"""
+    latest_train_time = _get_latest_snap_time(conn, TRAIN_7D_TABLE)
+    columns_sql = ", ".join(["SnapTime"] + NEED_PREDICT_BIO)
+    find_sql = f"""SELECT {columns_sql} FROM {SOURCE_AVG_TABLE}
+    WHERE SnapTime < %s AND SummaryInterval=1 AND SummaryIntervalUnit='天' AND DeviceID=%s"""
+    params = [target_day, BIOLOGY_DEVICE_ID]
+    if latest_train_time is not None:
+        find_sql += " AND SnapTime > %s"
+        params.append(latest_train_time)
+
+    df = _pd.read_sql(find_sql, conn, params=tuple(params))
+    if 'SnapTime' not in df.columns:
+        return
+    df['SnapTime'] = _pd.to_datetime(df['SnapTime'], errors='coerce')
+    df = df.dropna(subset=['SnapTime']).sort_values('SnapTime')
+    if df.empty:
+        print("7d训练表同步跳过：没有新的日级源数据")
+        return
+
+    target_index = _pd.DatetimeIndex(df['SnapTime'].drop_duplicates().sort_values())
+    water_window = _read_water_quality_means(conn, target_index, freq='D')
+
+    daily_rows = []
+    for _, source_row in df.iterrows():
+        snap_time = source_row['SnapTime']
+        row_data = {'SnapTime': snap_time.to_pydatetime()}
+        for bio_name in NEED_PREDICT_BIO:
+            value = _pd.to_numeric(_pd.Series([source_row.get(bio_name)]), errors='coerce').iloc[0]
+            row_data[bio_name] = 0.0 if _pd.isna(value) else float(value)
+        for variable_name in CONCOMITANT_VARIABLES:
+            row_data[variable_name] = float(water_window.loc[snap_time, variable_name])
+        daily_rows.append(row_data)
+
+    _write_daily_train_rows(conn, daily_rows)
 
 
 def _write_daily_window_to_predict_input(conn, history_by_species, target_day):
@@ -425,13 +640,7 @@ def _run_12h_pipeline(conn, current_time):
         return
 
     before_12h_times = _get_currenttime_before_12hour_fun(current_time)
-    history_by_species = _find_mysql_match_12h_data(
-        before_12h_times,
-        conn,
-        SOURCE_AVG_TABLE,
-        NEED_PREDICT_BIO,
-        CONCOMITANT_VARIABLES,
-    )
+    history_by_species = _build_hourly_history(conn, before_12h_times)
 
     _write_recent_source_hours_to_train(conn)
     conn.commit()
@@ -452,7 +661,7 @@ def _run_12h_pipeline(conn, current_time):
 
     if _should_retrain_at_fixed_hour(current_time, HOURLY_MODEL_RETRAIN_HOUR):
         print("开始小时模型每日重训")
-        _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO)
+        _read_12h_train_tab_to_train_model_fun(conn, TRAIN_12H_TABLE, NEED_PREDICT_BIO, CONCOMITANT_VARIABLES)
     else:
         print(f"当前不是小时模型固定重训小时 {HOURLY_MODEL_RETRAIN_HOUR}，或今日小时模型已训练，无需重训")
 
@@ -472,7 +681,7 @@ def _run_7d_pipeline(conn, current_time):
         print(f"{target_day} 的日预测记录已存在，跳过7d日预测")
         return
 
-    history_by_species, daily_rows, source_days = _build_daily_history(conn, target_day)
+    history_by_species, source_days = _build_daily_history(conn, target_day)
     real_daily_days = 0
     for day_offset in range(7):
         day = (target_day - _timedelta(days=7 - day_offset)).date()
@@ -482,13 +691,16 @@ def _run_7d_pipeline(conn, current_time):
         print(f"日预测跳过：最近7个完整自然日真实数据只有 {real_daily_days} 天，少于 {MIN_DAILY_SOURCE_DAYS} 天")
         return
 
-    _write_daily_train_rows(conn, daily_rows)
+    _write_incremental_daily_source_to_train(conn, target_day)
 
     if _should_retrain_at_fixed_hour(current_time, DAILY_MODEL_RETRAIN_HOUR, model_suffix="_d7"):
         print("开始7d日模型每日重训")
-        trained = _read_7d_train_tab_to_train_model_fun(conn, TRAIN_7D_TABLE, NEED_PREDICT_BIO)
+        trained = _read_7d_train_tab_to_train_model_fun(conn, TRAIN_7D_TABLE, NEED_PREDICT_BIO, CONCOMITANT_VARIABLES)
         if not trained:
             raise RuntimeError("7d日模型训练数据不足，无法完成日预测")
+
+    if not _ensure_daily_models_exist(conn):
+        return
 
     _validate_model_files(model_suffix="_d7")
     predict_row = _predict_all_species(history_by_species, target_day, _d7_predict_next_1d_points)
@@ -505,6 +717,7 @@ def _run_once():
     _ensure_required_tables()
     conn = _connect_database()
     try:
+        _ensure_target_table_columns(conn)
         _run_12h_pipeline(conn, current_time)
         _run_7d_pipeline(conn, current_time)
     finally:
