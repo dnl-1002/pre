@@ -28,7 +28,9 @@ from nbeats.nbeats_model import d7_predict_next_1d_points as _d7_predict_next_1d
 from nbeats.nbeats_model import h12_predict_next_1h_points as _h12_predict_next_1h_points
 from pymysql_data import create_mysql as _create_mysql
 from pymysql_data import mysqlConnect as _mysqlConnect
+from pymysql_data import mysql_column_type as _mysql_column_type
 from pymysql_data import mysqlinsert_12h_predict as _mysqlinsert_12h_predict
+
 
 
 _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
@@ -63,7 +65,7 @@ WATER_QUALITY_DEVICE_ID = 7 # 水质表查询设备
 
 #### 模型和运行配置。
 MODEL_DIR = "saved_models"   # 模型保存目录
-ENABLE_TEST_TIME_OVERRIDE = True # 是否启用测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
+ENABLE_TEST_TIME_OVERRIDE = False # 是否启用测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
 TEST_CURRENT_TIME = "2026-06-30 15:00:00" # 测试时间覆盖，启用后使用 TEST_CURRENT_TIME 作为当前时间
 ENABLE_7D_PREDICTION = True # 是否启用日预测
 DAILY_PREDICTION_HOUR = 13 # 日预测执行小时，0 表示在每天的 0 点执行日预测
@@ -142,7 +144,7 @@ def _ensure_columns_exist(conn, table_name, columns):
         existing_columns = {row[0] for row in cursor.fetchall()}
         for column_name in columns:
             if column_name not in existing_columns:
-                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN `{column_name}` VARCHAR(40)")
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN `{column_name}` {_mysql_column_type(column_name)}")
         conn.commit()
     except Exception:
         conn.rollback()

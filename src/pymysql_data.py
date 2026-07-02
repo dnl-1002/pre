@@ -4,6 +4,15 @@
 import pymysql
 
 
+def mysql_column_type(column_name):
+    """根据业务字段返回 MySQL 列类型。"""
+    if column_name in ("SnapTime", "PredictSnapTime"):
+        return "DATETIME"
+    if column_name == "Id":
+        return "INT"
+    return "DOUBLE"
+
+
 
 #####12h小时预测结果插入
 def mysqlinsert_12h_predict(conn,tab_name,signal_info_arr,key_name_arr):
@@ -77,7 +86,7 @@ def create_mysql(key_name_arr,data_ip_set,data_port_set,data_user_set,data_passw
     conn = pymysql.connect(host=data_ip_set, port=data_port_set, user=data_user_set, passwd=data_password_set,
                            db=data_name_set, charset='utf8')
     cur = conn.cursor()
-    columns = ', '.join([f"{keyword} VARCHAR(40)" for keyword in key_name_arr])
+    columns = ', '.join([f"`{keyword}` {mysql_column_type(keyword)}" for keyword in key_name_arr])
     id_auto_add =  'Id INT AUTO_INCREMENT PRIMARY KEY,'
     print('@@@@@@',columns)
     create_table_query = f"CREATE TABLE IF NOT EXISTS {tab_name} ({id_auto_add+columns})"

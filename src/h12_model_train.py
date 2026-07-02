@@ -88,7 +88,9 @@ def save_model_and_params(model,train_model_bio_i, save_dir='saved_models', mode
         'val_loss': 'MAE',
         'seasonality': 1,
         'random_seed': 32,
-        'input_size': len(model.include_var_dict['y'])  # 从include_var_dict获取input_size
+        'input_size': input_size_multiplier,
+        'history_window_size': input_size_multiplier,
+        'y_lag_count': len(model.include_var_dict['y'])
     }
 
     # 保存配置参数
@@ -98,7 +100,7 @@ def save_model_and_params(model,train_model_bio_i, save_dir='saved_models', mode
 
     print(f"\n模型和参数已保存到 {save_dir}")
     print("\n关键参数验证:")
-    key_params = ['input_size', 'output_size', 'n_blocks', 'n_hidden',
+    key_params = ['input_size', 'history_window_size', 'output_size', 'n_blocks', 'n_hidden',
                  'learning_rate', 'n_iterations', 'n_harmonics', 'n_polynomials']
     for param in key_params:
         print(f"{param}: {model_config[param]}")
